@@ -1,7 +1,7 @@
 ## init
 
 ```shell
-go mod init
+go mod init cmdq
 go mod tidy
 ```
 
