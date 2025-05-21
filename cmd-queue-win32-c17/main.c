@@ -1,11 +1,8 @@
-// #define UNICODE
-// #define _UNICODE
-
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <wchar.h> // For wcscat_s, wcscpy_s, etc.
+#include <wchar.h> // For wcscat_s, wcscpy_s, etc. _wcsdup
 #include <tchar.h> // For _TCHAR, _tcscpy, etc. (though direct W functions are used)
 #include <commctrl.h> // For some common controls if ever needed, not strictly for this set.
 
@@ -77,9 +74,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 DWORD WINAPI CommandProcessorThread(LPVOID lpParam);
 void AddToQueue(const wchar_t* prefix, const wchar_t* suffix);
 void UpdateDashboardUI(void);
-void PostLogChunkToUI(const char* utf8_chunk, BOOL is_stderr, BOOL is_progress);
+void PostLogChunkToUI(const char* utf8_chunk, BOOL is_stderr_color_hint, BOOL is_progress);
+void PostLogChunkToUI_Wide(const wchar_t* wide_chunk, BOOL is_stderr_color_hint, BOOL is_progress);
 wchar_t* Utf8ToWide(const char* utf8String);
-char* WideToUtf8(const wchar_t* wideString); // For command arguments if needed
+// char* WideToUtf8(const wchar_t* wideString); // For command arguments if needed (not currently used)
 void InitializeUIFont(void);
 void CreateControls(HWND hwndParent);
 void TrimTrailingCr(wchar_t* str);
@@ -88,10 +86,7 @@ void TrimTrailingCr(wchar_t* str);
 // --- Entry Point ---
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     g_hInstance = hInstance;
-
-    // Initialize COM for condition variables, though not strictly necessary for basic use
-    // CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-
+    
     InitializeCriticalSection(&g_queueLock);
     InitializeCriticalSection(&g_dashboardLock);
     InitializeConditionVariable(&g_queueNotEmpty);
@@ -119,7 +114,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     PostLogChunkToUI("Application starting...", FALSE, FALSE);
     wchar_t initialMsg[256];
     swprintf(initialMsg, 256, L"Initial command prefix set to: %s (editable in GUI)", g_initialCmdPrefix);
-    PostLogChunkToUI((const char*)initialMsg, FALSE, TRUE); // Using TRUE for is_progress to ensure it shows up
+    PostLogChunkToUI_Wide(initialMsg, FALSE, TRUE); 
     PostLogChunkToUI("Enter command suffix and click 'Add to Queue' or press Enter.", FALSE, FALSE);
     PostLogChunkToUI("Close window or press Alt+F4 to quit.", FALSE, FALSE);
 
@@ -127,15 +122,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
     int windowWidth = 600;
-    int windowHeight = 500;
+    int windowHeight = 500; // Increased height a bit for more dashboard visibility
     int windowX = (screenWidth - windowWidth) / 2;
     int windowY = (screenHeight - windowHeight) / 2;
 
     g_hwndMain = CreateWindowExW(
-        0, // WS_EX_CLIENTEDGE for sunken border, not usually on main window
+        0, 
         WINDOW_CLASS_NAME,
         L"Cmd Queue GUI (C Version)",
-        WS_OVERLAPPEDWINDOW, // Standard window
+        WS_OVERLAPPEDWINDOW, 
         windowX, windowY, windowWidth, windowHeight,
         NULL, NULL, hInstance, NULL
     );
@@ -148,38 +143,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ShowWindow(g_hwndMain, nCmdShow);
     UpdateWindow(g_hwndMain);
 
-    // Start command processor thread
     g_hCommandProcessorThread = CreateThread(NULL, 0, CommandProcessorThread, NULL, 0, NULL);
     if (g_hCommandProcessorThread == NULL) {
         MessageBoxW(NULL, L"Failed to create command processor thread!", L"Error", MB_ICONEXCLAMATION | MB_OK);
-        // Handle error: clean up, exit, etc.
         return 1;
     }
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0) > 0) {
-        // Special handling for Enter key in the suffix input to trigger "Add" button
         if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
             HWND hFocused = GetFocus();
             if (hFocused == g_hwndInputEdit) {
-                 // Simulate button click by sending WM_COMMAND
                 SendMessage(g_hwndMain, WM_COMMAND, MAKEWPARAM(IDC_BUTTON_ADD, BN_CLICKED), (LPARAM)g_hwndButtonAdd);
-                continue; // Message handled, don't pass to Translate/Dispatch
+                continue; 
             }
         }
-        // Standard message loop for non-dialog windows
-        // If IsDialogMessage is needed for TAB key navigation between controls and accelerators:
-        // if (!IsDialogMessage(g_hwndMain, &msg)) { // g_hwndMain isn't a dialog, but for modeless dialog behavior
-             TranslateMessage(&msg);
-             DispatchMessage(&msg);
-        // }
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
     }
 
-    // Wait for command processor thread to finish
     if (g_hCommandProcessorThread) {
         g_appExiting = TRUE;
         EnterCriticalSection(&g_queueLock);
-        WakeConditionVariable(&g_queueNotEmpty); // Wake up if sleeping
+        WakeConditionVariable(&g_queueNotEmpty); 
         LeaveCriticalSection(&g_queueLock);
         WaitForSingleObject(g_hCommandProcessorThread, INFINITE);
         CloseHandle(g_hCommandProcessorThread);
@@ -187,8 +173,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     DeleteCriticalSection(&g_queueLock);
     DeleteCriticalSection(&g_dashboardLock);
-    // CoUninitialize();
-
+    
     if (g_hFont) DeleteObject(g_hFont);
     
     return (int)msg.wParam;
@@ -200,12 +185,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
             CreateControls(hwnd);
-            UpdateDashboardUI(); // Initial dashboard state
+            UpdateDashboardUI(); 
             break;
 
         case WM_COMMAND: {
             WORD controlId = LOWORD(wParam);
-            WORD notifyCode = HIWORD(wParam); // e.g., BN_CLICKED
+            WORD notifyCode = HIWORD(wParam); 
 
             if (controlId == IDC_BUTTON_ADD && notifyCode == BN_CLICKED) {
                 wchar_t prefix_buffer[512];
@@ -214,20 +199,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 GetWindowTextW(g_hwndPrefixEdit, prefix_buffer, sizeof(prefix_buffer)/sizeof(wchar_t));
                 GetWindowTextW(g_hwndInputEdit, suffix_buffer, sizeof(suffix_buffer)/sizeof(wchar_t));
                 
-                // Trim whitespace (basic example)
                 wchar_t *p = prefix_buffer + wcslen(prefix_buffer);
                 while (p > prefix_buffer && iswspace(*(p-1))) *--p = 0;
                 wchar_t *s = prefix_buffer;
                 while (*s && iswspace(*s)) s++;
                 memmove(prefix_buffer, s, (wcslen(s)+1)*sizeof(wchar_t));
 
-
                 p = suffix_buffer + wcslen(suffix_buffer);
                 while (p > suffix_buffer && iswspace(*(p-1))) *--p = 0;
                 s = suffix_buffer;
                 while (*s && iswspace(*s)) s++;
                 memmove(suffix_buffer, s, (wcslen(s)+1)*sizeof(wchar_t));
-
 
                 if (wcslen(prefix_buffer) == 0) {
                     PostLogChunkToUI("Error: Command prefix cannot be empty.", TRUE, FALSE);
@@ -236,7 +218,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     AddToQueue(prefix_buffer, suffix_buffer);
                     wchar_t logMsg[1600];
                     swprintf(logMsg, sizeof(logMsg)/sizeof(wchar_t), L"Added to queue: [%s] %s", prefix_buffer, suffix_buffer);
-                    PostLogChunkToUI((const char*)logMsg, FALSE, TRUE); // Use TRUE for is_progress to force display logic
+                    PostLogChunkToUI_Wide(logMsg, FALSE, TRUE); 
                     SetWindowTextW(g_hwndInputEdit, L"");
                     SetFocus(g_hwndInputEdit);
                     PostMessage(hwnd, WM_APP_UPDATE_DASHBOARD, 0, 0);
@@ -250,40 +232,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (!chunk || !chunk->text) break;
 
             int currentLen = GetWindowTextLengthW(g_hwndLog);
-            SendMessageW(g_hwndLog, EM_SETSEL, currentLen, currentLen); // Move caret to end
+            SendMessageW(g_hwndLog, EM_SETSEL, currentLen, currentLen); 
 
             if (chunk->is_progress_line) {
-                // Find start of the last visible line to replace it
-                // This is tricky if lines wrap. Assuming no wrap for ES_AUTOHSCROLL.
-                // A simple approach: if the log already contains text, and this is a progress line,
-                // try to replace the content after the last \r\n.
-                // More robust: Get current line count, then index of last line.
                 LRESULT lineCount = SendMessageW(g_hwndLog, EM_GETLINECOUNT, 0, 0);
                 if (lineCount > 0) {
                     LRESULT lastLineStartCharIndex = SendMessageW(g_hwndLog, EM_LINEINDEX, lineCount - 1, 0);
                     if (lastLineStartCharIndex != (LRESULT)-1) {
-                         SendMessageW(g_hwndLog, EM_SETSEL, lastLineStartCharIndex, -1); // Select last line
+                         SendMessageW(g_hwndLog, EM_SETSEL, lastLineStartCharIndex, -1); 
                     }
                 }
             }
             
-            // Append text (or replace selection if set above)
             SendMessageW(g_hwndLog, EM_REPLACESEL, TRUE, (LPARAM)chunk->text);
 
-            // Ensure log does not exceed max lines
             LRESULT lines = SendMessageW(g_hwndLog, EM_GETLINECOUNT, 0, 0);
             while (lines > MAX_LOG_LINES_IN_EDIT_CONTROL) {
-                LRESULT firstLineEnd = SendMessageW(g_hwndLog, EM_LINEINDEX, 1, 0); // Index of start of 2nd line
-                if (firstLineEnd == -1) { // Only one very long line, or error
-                    SendMessageW(g_hwndLog, EM_SETSEL, 0, GetWindowTextLengthW(g_hwndLog)/2); // Delete half
+                LRESULT firstLineEnd = SendMessageW(g_hwndLog, EM_LINEINDEX, 1, 0); 
+                if (firstLineEnd == -1) { 
+                    SendMessageW(g_hwndLog, EM_SETSEL, 0, GetWindowTextLengthW(g_hwndLog)/2); 
                 } else {
-                    SendMessageW(g_hwndLog, EM_SETSEL, 0, firstLineEnd); // Select first line
+                    SendMessageW(g_hwndLog, EM_SETSEL, 0, firstLineEnd); 
                 }
-                SendMessageW(g_hwndLog, EM_REPLACESEL, TRUE, (LPARAM)L""); // Delete selected
+                SendMessageW(g_hwndLog, EM_REPLACESEL, TRUE, (LPARAM)L""); 
                 lines = SendMessageW(g_hwndLog, EM_GETLINECOUNT, 0, 0);
             }
 
-            // Scroll to end
             currentLen = GetWindowTextLengthW(g_hwndLog);
             SendMessageW(g_hwndLog, EM_SETSEL, currentLen, currentLen);
             SendMessageW(g_hwndLog, EM_SCROLLCARET, 0, 0);
@@ -298,7 +272,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
 
         case WM_APP_COMMAND_DONE:
-            // Command finished, update dashboard (current command becomes "Idle")
             EnterCriticalSection(&g_dashboardLock);
             wcscpy_s(g_currentCommand, sizeof(g_currentCommand)/sizeof(wchar_t), L"Idle");
             LeaveCriticalSection(&g_dashboardLock);
@@ -312,10 +285,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
 
         case WM_SIZE:
-            // Basic resize handling (can be improved)
-            // For simplicity, this example doesn't dynamically resize all controls perfectly.
-            // You'd use MoveWindow for each child control here based on GetClientRect.
-            // Example: MoveWindow(g_hwndLog, 10, y_pos_log, LOWORD(lParam) - 20, new_log_height, TRUE);
+            // TODO: Implement control resizing here for better responsiveness
+            // Example:
+            // RECT rcClient;
+            // GetClientRect(hwnd, &rcClient);
+            // int newWidth = rcClient.right - rcClient.left - 2 * margin;
+            // MoveWindow(g_hwndPrefixEdit, margin, y_pos_prefix_edit, newWidth, controlHeight, TRUE);
+            // ... and so on for other controls ...
+            // RedrawWindow(hwnd, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
             break;
 
         case WM_CLOSE:
@@ -323,9 +300,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
 
         case WM_DESTROY:
-            g_appExiting = TRUE; // Signal threads
+            g_appExiting = TRUE; 
             EnterCriticalSection(&g_queueLock);
-            WakeConditionVariable(&g_queueNotEmpty); // Wake command processor if it's waiting
+            WakeConditionVariable(&g_queueNotEmpty); 
             LeaveCriticalSection(&g_queueLock);
             PostQuitMessage(0);
             break;
@@ -339,7 +316,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // --- UI Helpers ---
 void InitializeUIFont(void) {
     LOGFONTW lf = {0};
-    lf.lfHeight = -MulDiv(10, GetDeviceCaps(GetDC(NULL), LOGPIXELSY), 72); // 10pt font
+    lf.lfHeight = -MulDiv(10, GetDeviceCaps(GetDC(NULL), LOGPIXELSY), 72); 
     lf.lfWeight = FW_NORMAL;
     lf.lfCharSet = DEFAULT_CHARSET;
     wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"Segoe UI");
@@ -360,58 +337,52 @@ void CreateControls(HWND hwndParent) {
     int labelWidth = editWidth;
 
 
-    // Command Prefix Label
     g_hwndPrefixLabel = CreateWindowExW(0, L"STATIC", L"Command Prefix:",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         margin, currentY, labelWidth, labelHeight, hwndParent, (HMENU)IDC_STATIC_PREFIX_LABEL, g_hInstance, NULL);
     SendMessageW(g_hwndPrefixLabel, WM_SETFONT, (WPARAM)g_hFont, TRUE);
     currentY += labelHeight + gap;
 
-    // Command Prefix Edit
     g_hwndPrefixEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", g_initialCmdPrefix,
         WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP,
         margin, currentY, editWidth, controlHeight, hwndParent, (HMENU)IDC_EDIT_PREFIX, g_hInstance, NULL);
     SendMessageW(g_hwndPrefixEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
     currentY += controlHeight + gap * 2;
 
-    // Dashboard Label
     g_hwndDashboardLabel = CreateWindowExW(0, L"STATIC", L"Dashboard:",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         margin, currentY, labelWidth, labelHeight, hwndParent, (HMENU)IDC_STATIC_DASHBOARD_LABEL, g_hInstance, NULL);
     SendMessageW(g_hwndDashboardLabel, WM_SETFONT, (WPARAM)g_hFont, TRUE);
     currentY += labelHeight + gap;
 
-    // Dashboard Display (Static Text)
-    g_hwndDashboard = CreateWindowExW(WS_EX_CLIENTEDGE, L"STATIC", L"", // Initially empty
-        WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP, // SS_LEFTNOWORDWRAP important for multi-line static
-        margin, currentY, editWidth, 60, hwndParent, (HMENU)IDC_STATIC_DASHBOARD, g_hInstance, NULL);
+    // Dashboard Display (Read-only Edit Control with Scrollbar)
+    int dashboardHeight = 80; // Increased height for dashboard
+    g_hwndDashboard = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", 
+        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | WS_TABSTOP,
+        margin, currentY, editWidth, dashboardHeight, hwndParent, (HMENU)IDC_STATIC_DASHBOARD, g_hInstance, NULL);
     SendMessageW(g_hwndDashboard, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-    currentY += 60 + gap * 2;
+    currentY += dashboardHeight + gap * 2;
 
-    // Log Label
     g_hwndLogLabel = CreateWindowExW(0, L"STATIC", L"Log Output:",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         margin, currentY, labelWidth, labelHeight, hwndParent, (HMENU)IDC_STATIC_LOG_LABEL, g_hInstance, NULL);
     SendMessageW(g_hwndLogLabel, WM_SETFONT, (WPARAM)g_hFont, TRUE);
     currentY += labelHeight + gap;
 
-    // Log Edit Control
-    int logHeight = clientRect.bottom - currentY - controlHeight - gap * 3 - margin; // Calculate remaining height
-    if (logHeight < 50) logHeight = 50; // Minimum height
+    int logHeight = clientRect.bottom - currentY - controlHeight - gap * 3 - margin; 
+    if (logHeight < 50) logHeight = 50; 
     g_hwndLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP,
         margin, currentY, editWidth, logHeight, hwndParent, (HMENU)IDC_EDIT_LOG, g_hInstance, NULL);
     SendMessageW(g_hwndLog, WM_SETFONT, (WPARAM)g_hFont, TRUE);
     currentY += logHeight + gap * 2;
 
-    // Suffix Input Label
     int suffixLabelWidth = 80;
     g_hwndInputLabel = CreateWindowExW(0, L"STATIC", L"Cmd Suffix:",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         margin, currentY, suffixLabelWidth, labelHeight, hwndParent, (HMENU)IDC_STATIC_INPUT_LABEL, g_hInstance, NULL);
     SendMessageW(g_hwndInputLabel, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
-    // Suffix Input Edit Control
     int buttonWidth = 100;
     int suffixEditX = margin + suffixLabelWidth + gap;
     int suffixEditWidth = editWidth - suffixLabelWidth - gap - buttonWidth - gap;
@@ -420,10 +391,9 @@ void CreateControls(HWND hwndParent) {
         suffixEditX, currentY, suffixEditWidth, controlHeight, hwndParent, (HMENU)IDC_EDIT_INPUT, g_hInstance, NULL);
     SendMessageW(g_hwndInputEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
-    // Add Button
     int buttonX = suffixEditX + suffixEditWidth + gap;
     g_hwndButtonAdd = CreateWindowExW(0, L"BUTTON", L"Add to Queue",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, // BS_DEFPUSHBUTTON might also work well here
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, 
         buttonX, currentY, buttonWidth, controlHeight, hwndParent, (HMENU)IDC_BUTTON_ADD, g_hInstance, NULL);
     SendMessageW(g_hwndButtonAdd, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
@@ -433,25 +403,101 @@ void CreateControls(HWND hwndParent) {
 void UpdateDashboardUI(void) {
     if (!g_hwndDashboard || !g_hwndMain) return;
 
-    EnterCriticalSection(&g_queueLock);
-    int queueLen = g_queueCount;
-    LeaveCriticalSection(&g_queueLock);
+    wchar_t dashboardText[8192]; // Increased buffer for dashboard display
+    dashboardText[0] = L'\0';    // Initialize to empty string
 
     EnterCriticalSection(&g_dashboardLock);
-    wchar_t currentCmdCopy[sizeof(g_currentCommand)/sizeof(wchar_t)];
-    wcscpy_s(currentCmdCopy, sizeof(currentCmdCopy)/sizeof(wchar_t), g_currentCommand);
+    wchar_t currentCmdCopy[sizeof(g_currentCommand) / sizeof(wchar_t)];
+    wcscpy_s(currentCmdCopy, sizeof(currentCmdCopy) / sizeof(wchar_t), g_currentCommand);
     LeaveCriticalSection(&g_dashboardLock);
 
-    wchar_t dashboardText[1024];
-    swprintf(dashboardText, sizeof(dashboardText)/sizeof(wchar_t),
-             L"Current CMD:\r\n%s\r\n\r\nQueue (%d pending):", currentCmdCopy, queueLen);
+    // Temporary storage for queue items to minimize time queueLock is held
+    QueuedTask tempQueueCopy[MAX_QUEUE_SIZE];
+    int tempQueueCount = 0;
+
+    EnterCriticalSection(&g_queueLock);
+    int queueLen = g_queueCount;
+    if (queueLen > 0) {
+        int currentHead = g_queueHead;
+        for (int i = 0; i < queueLen; ++i) {
+            if (tempQueueCount >= MAX_QUEUE_SIZE) break; // Should not happen if queueLen is correct
+            int idx = (currentHead + i) % MAX_QUEUE_SIZE;
+            if (g_taskQueue[idx].prefix && g_taskQueue[idx].suffix) {
+                tempQueueCopy[tempQueueCount].prefix = _wcsdup(g_taskQueue[idx].prefix);
+                tempQueueCopy[tempQueueCount].suffix = _wcsdup(g_taskQueue[idx].suffix);
+                // Check if _wcsdup succeeded
+                if (tempQueueCopy[tempQueueCount].prefix && tempQueueCopy[tempQueueCount].suffix) {
+                    tempQueueCount++;
+                } else { // Free if one allocation failed but other succeeded
+                    if (tempQueueCopy[tempQueueCount].prefix) free(tempQueueCopy[tempQueueCount].prefix);
+                    if (tempQueueCopy[tempQueueCount].suffix) free(tempQueueCopy[tempQueueCount].suffix);
+                    tempQueueCopy[tempQueueCount].prefix = NULL; // Mark as invalid
+                    tempQueueCopy[tempQueueCount].suffix = NULL;
+                    // Optionally log an error here
+                }
+            }
+        }
+    }
+    LeaveCriticalSection(&g_queueLock);
+
+    // Format the dashboardText using the copied queue data
+    size_t currentTextLen = 0;
+    int written = swprintf(dashboardText, sizeof(dashboardText) / sizeof(wchar_t),
+                           L"Current CMD:\r\n%s\r\n\r\nQueue (%d pending):", currentCmdCopy, queueLen);
+    
+    if (written < 0) { // Error in swprintf or buffer too small for header
+        wcscpy_s(dashboardText, sizeof(dashboardText) / sizeof(wchar_t), L"Error generating dashboard header.");
+    } else {
+        currentTextLen = written;
+    }
 
     if (queueLen == 0) {
-        wcscat_s(dashboardText, sizeof(dashboardText)/sizeof(wchar_t), L"\r\n[Empty]");
+        const wchar_t* emptyMsg = L"\r\n[Empty]";
+        if (currentTextLen + wcslen(emptyMsg) < sizeof(dashboardText) / sizeof(wchar_t)) {
+            wcscat_s(dashboardText, sizeof(dashboardText) / sizeof(wchar_t), emptyMsg);
+        }
     } else {
-         wcscat_s(dashboardText, sizeof(dashboardText)/sizeof(wchar_t), L"\r\n(Tasks in queue...)");
+        const wchar_t* rn = L"\r\n";
+        if (currentTextLen + wcslen(rn) < sizeof(dashboardText) / sizeof(wchar_t)) {
+            wcscat_s(dashboardText, sizeof(dashboardText) / sizeof(wchar_t), rn);
+            currentTextLen += wcslen(rn);
+        }
+
+        for (int i = 0; i < tempQueueCount; ++i) {
+            if (!tempQueueCopy[i].prefix || !tempQueueCopy[i].suffix) continue; // Skip if wcsdup failed
+
+            wchar_t singleItem[512 + 1024 + 30]; // prefix + space + suffix + numbering + \r\n + safety
+            written = swprintf(singleItem, sizeof(singleItem) / sizeof(wchar_t),
+                               L"%d. %s %s\r\n",
+                               i + 1,
+                               tempQueueCopy[i].prefix,
+                               tempQueueCopy[i].suffix);
+
+            if (written > 0) {
+                if (currentTextLen + (size_t)written < sizeof(dashboardText) / sizeof(wchar_t)) {
+                    wcscat_s(dashboardText, sizeof(dashboardText) / sizeof(wchar_t), singleItem);
+                    currentTextLen += written;
+                } else {
+                    const wchar_t* truncationMsg = L"... (queue list truncated)\r\n";
+                    if (currentTextLen + wcslen(truncationMsg) < sizeof(dashboardText) / sizeof(wchar_t)) {
+                        wcscat_s(dashboardText, sizeof(dashboardText) / sizeof(wchar_t), truncationMsg);
+                    }
+                    break; // Dashboard text buffer full
+                }
+            }
+        }
     }
+
     SetWindowTextW(g_hwndDashboard, dashboardText);
+
+    // Free duplicated strings
+    for (int i = 0; i < tempQueueCount; ++i) {
+        if (tempQueueCopy[i].prefix) free(tempQueueCopy[i].prefix);
+        if (tempQueueCopy[i].suffix) free(tempQueueCopy[i].suffix);
+    }
+    // For EDIT control, ensure it's scrolled to the top to show the "Current CMD" first
+    SendMessageW(g_hwndDashboard, EM_SETSEL, (WPARAM)0, (LPARAM)0);
+    SendMessageW(g_hwndDashboard, EM_SCROLLCARET, 0, 0);
 }
 
 
@@ -462,9 +508,18 @@ void AddToQueue(const wchar_t* prefix, const wchar_t* suffix) {
     if (g_queueCount < MAX_QUEUE_SIZE) {
         g_taskQueue[g_queueTail].prefix = _wcsdup(prefix);
         g_taskQueue[g_queueTail].suffix = _wcsdup(suffix);
-        g_queueTail = (g_queueTail + 1) % MAX_QUEUE_SIZE;
-        g_queueCount++;
-        WakeConditionVariable(&g_queueNotEmpty);
+        // Check if _wcsdup succeeded
+        if (!g_taskQueue[g_queueTail].prefix || !g_taskQueue[g_queueTail].suffix) {
+            if (g_taskQueue[g_queueTail].prefix) free(g_taskQueue[g_queueTail].prefix);
+            if (g_taskQueue[g_queueTail].suffix) free(g_taskQueue[g_queueTail].suffix);
+            g_taskQueue[g_queueTail].prefix = NULL;
+            g_taskQueue[g_queueTail].suffix = NULL;
+            PostLogChunkToUI("Error: Memory allocation failed for new task.", TRUE, FALSE);
+        } else {
+            g_queueTail = (g_queueTail + 1) % MAX_QUEUE_SIZE;
+            g_queueCount++;
+            WakeConditionVariable(&g_queueNotEmpty);
+        }
     } else {
         PostLogChunkToUI("Error: Command queue is full.", TRUE, FALSE);
     }
@@ -480,14 +535,14 @@ QueuedTask GetFromQueue(void) {
         SleepConditionVariableCS(&g_queueNotEmpty, &g_queueLock, INFINITE);
     }
 
-    if (g_appExiting && g_queueCount == 0) { // Check again after waking if exiting
+    if (g_appExiting && g_queueCount == 0) { 
         LeaveCriticalSection(&g_queueLock);
-        return task; // Return empty task
+        return task; 
     }
     
     if (g_queueCount > 0) {
         task = g_taskQueue[g_queueHead];
-        g_taskQueue[g_queueHead].prefix = NULL; // Prevent double free if app exits abruptly
+        g_taskQueue[g_queueHead].prefix = NULL; 
         g_taskQueue[g_queueHead].suffix = NULL;
         g_queueHead = (g_queueHead + 1) % MAX_QUEUE_SIZE;
         g_queueCount--;
@@ -501,46 +556,49 @@ DWORD WINAPI PipeReaderThread(LPVOID lpParam) {
     HANDLE hPipeRead = (HANDLE)lpParam;
     char buffer[PIPE_BUFFER_SIZE];
     DWORD bytesRead;
-    BOOL isStdErr = FALSE; // This needs to be passed if we differentiate, or use two threads
+    BOOL isStdErr = FALSE; // TODO: This should be passed as part of lpParam if differentiation is needed.
+                           // For now, all pipe output is treated as non-stderr for color hints.
 
-    // A simple way to check if it's stderr pipe (if we had two such threads)
-    // For now, assume stdout for this example thread, or make it generic.
-
-    char partialLineBuffer[PIPE_BUFFER_SIZE * 2] = {0}; // Buffer for incomplete UTF-8 sequences or lines
+    char partialLineBuffer[PIPE_BUFFER_SIZE * 2] = {0}; 
     int partialLen = 0;
 
     while (ReadFile(hPipeRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
-        buffer[bytesRead] = '\0'; // Null-terminate the read chunk
+        buffer[bytesRead] = '\0'; 
 
-        // Append to partial line buffer
         if (partialLen + bytesRead < sizeof(partialLineBuffer)) {
+            // Using strncat_s or similar would be safer if buffer could contain nulls before bytesRead
             strcat_s(partialLineBuffer, sizeof(partialLineBuffer), buffer);
             partialLen += bytesRead;
         } else {
-            // Buffer overflow, log an error and process what we have
-            PostLogChunkToUI("Pipe reader buffer overflow.", TRUE, FALSE); // is_stderr = TRUE for error
-            // process partialLineBuffer as is
-            partialLen = 0; // reset
+            PostLogChunkToUI("Pipe reader buffer overflow (partial line).", TRUE, FALSE); 
+            // Process what's there, then copy the new buffer content, possibly losing middle part.
+            // A more robust way would be to process partialLineBuffer, then process `buffer` directly.
+            // For simplicity, we might just clear and restart with `buffer`.
+            if (strlen(buffer) < sizeof(partialLineBuffer)) {
+                strcpy_s(partialLineBuffer, sizeof(partialLineBuffer), buffer);
+                partialLen = strlen(buffer);
+            } else {
+                 partialLineBuffer[0] = '\0'; // Cannot fit, discard
+                 partialLen = 0;
+                 PostLogChunkToUI("Pipe reader new chunk too large after overflow.", TRUE, FALSE);
+            }
         }
         
         char* lineStart = partialLineBuffer;
         char* lineEnd;
 
         while ((lineEnd = strpbrk(lineStart, "\r\n")) != NULL) {
-            BOOL isProgress = (*lineEnd == '\r' && *(lineEnd + 1) != '\n');
-            *lineEnd = '\0'; // Null-terminate the line
+            BOOL isProgress = (*lineEnd == '\r' && *(lineEnd + 1) != '\n' && *(lineEnd + 1) != '\0');
+            *lineEnd = '\0'; 
 
             PostLogChunkToUI(lineStart, isStdErr, isProgress);
 
-            lineStart = lineEnd + 1; // Move to start of next potential line
-            if (isProgress && *lineStart == '\n') { // Handle CRLF if \r was for progress line end
-                lineStart++; 
-            } else if (!isProgress && *lineEnd == '\r' && *lineStart == '\n') { // Normal CRLF
+            lineStart = lineEnd + 1; 
+            if (*lineEnd == '\r' && *lineStart == '\n') { // Handle CRLF
                  lineStart++;
             }
         }
         
-        // Move remaining part to the beginning of partialLineBuffer
         if (*lineStart != '\0') {
             strcpy_s(partialLineBuffer, sizeof(partialLineBuffer), lineStart);
             partialLen = strlen(partialLineBuffer);
@@ -550,7 +608,6 @@ DWORD WINAPI PipeReaderThread(LPVOID lpParam) {
         }
     }
     
-    // Process any remaining data in partialLineBuffer after pipe closes
     if (partialLen > 0) {
         PostLogChunkToUI(partialLineBuffer, isStdErr, FALSE);
     }
@@ -562,12 +619,12 @@ DWORD WINAPI PipeReaderThread(LPVOID lpParam) {
 DWORD WINAPI CommandProcessorThread(LPVOID lpParam) {
     while (!g_appExiting) {
         QueuedTask task = GetFromQueue();
-        if (g_appExiting && (task.prefix == NULL || task.suffix == NULL)) { // Check if woken up to exit
+        if (g_appExiting && (task.prefix == NULL || task.suffix == NULL)) { 
              if (task.prefix) free(task.prefix);
              if (task.suffix) free(task.suffix);
              break;
         }
-        if (task.prefix == NULL) continue; // Should not happen if not exiting
+        if (task.prefix == NULL || task.suffix == NULL) continue; 
 
         wchar_t fullCmdLine[2048];
         swprintf(fullCmdLine, sizeof(fullCmdLine)/sizeof(wchar_t), L"%s %s", task.prefix, task.suffix);
@@ -579,7 +636,7 @@ DWORD WINAPI CommandProcessorThread(LPVOID lpParam) {
 
         wchar_t logMsg[2100];
         swprintf(logMsg, sizeof(logMsg)/sizeof(wchar_t), L"$ %s", fullCmdLine);
-        PostLogChunkToUI((const char*)logMsg, FALSE, TRUE); // Post as UTF-16 directly for this internal log
+        PostLogChunkToUI_Wide(logMsg, FALSE, TRUE); 
 
         STARTUPINFOW si = {0};
         PROCESS_INFORMATION pi = {0};
@@ -597,67 +654,76 @@ DWORD WINAPI CommandProcessorThread(LPVOID lpParam) {
         HANDLE hChildStd_ERR_Rd = NULL;
         HANDLE hChildStd_ERR_Wr = NULL;
 
-        CreatePipe(&hChildStd_OUT_Rd, &hChildStd_OUT_Wr, &sa, 0);
-        SetHandleInformation(hChildStd_OUT_Rd, HANDLE_FLAG_INHERIT, 0); // Read handle is not inherited
+        // Create pipes for stdout
+        if (!CreatePipe(&hChildStd_OUT_Rd, &hChildStd_OUT_Wr, &sa, 0)) {
+            PostLogChunkToUI_Wide(L"CreatePipe (stdout) failed.", TRUE, FALSE);
+            goto cleanup_task;
+        }
+        if (!SetHandleInformation(hChildStd_OUT_Rd, HANDLE_FLAG_INHERIT, 0)) { // Read handle is not inherited
+            PostLogChunkToUI_Wide(L"SetHandleInformation (stdout_rd) failed.", TRUE, FALSE);
+            CloseHandle(hChildStd_OUT_Rd); CloseHandle(hChildStd_OUT_Wr);
+            goto cleanup_task;
+        }
         si.hStdOutput = hChildStd_OUT_Wr;
 
-        CreatePipe(&hChildStd_ERR_Rd, &hChildStd_ERR_Wr, &sa, 0);
-        SetHandleInformation(hChildStd_ERR_Rd, HANDLE_FLAG_INHERIT, 0);
+        // Create pipes for stderr
+        if (!CreatePipe(&hChildStd_ERR_Rd, &hChildStd_ERR_Wr, &sa, 0)) {
+            PostLogChunkToUI_Wide(L"CreatePipe (stderr) failed.", TRUE, FALSE);
+            CloseHandle(hChildStd_OUT_Rd); CloseHandle(hChildStd_OUT_Wr);
+            goto cleanup_task;
+        }
+        if (!SetHandleInformation(hChildStd_ERR_Rd, HANDLE_FLAG_INHERIT, 0)) { // Read handle is not inherited
+            PostLogChunkToUI_Wide(L"SetHandleInformation (stderr_rd) failed.", TRUE, FALSE);
+            CloseHandle(hChildStd_OUT_Rd); CloseHandle(hChildStd_OUT_Wr);
+            CloseHandle(hChildStd_ERR_Rd); CloseHandle(hChildStd_ERR_Wr);
+            goto cleanup_task;
+        }
         si.hStdError = hChildStd_ERR_Wr;
         
-        // si.hStdInput can be set to GetStdHandle(STD_INPUT_HANDLE) or a pipe for input if needed
         si.hStdInput = GetStdHandle(STD_INPUT_HANDLE); // Or NULL if no input redirection
 
         BOOL success = CreateProcessW(
-            NULL,           // Application name (use NULL if cmd line has it)
-            fullCmdLine,    // Command line (mutable buffer)
-            NULL,           // Process security attributes
-            NULL,           // Thread security attributes
-            TRUE,           // Inherit handles (for pipes)
-            CREATE_NO_WINDOW, // Creation flags: no console window
-            NULL,           // Environment block (NULL for parent's)
-            NULL,           // Current directory (NULL for parent's)
-            &si,            // STARTUPINFO
-            &pi             // PROCESS_INFORMATION
-        );
+            NULL, fullCmdLine, NULL, NULL, TRUE, 
+            CREATE_NO_WINDOW, NULL, NULL, &si, &pi );
+
+        // After CreateProcess, parent must close its write ends of pipes
+        // so ReadFile on read ends will break when child closes its write ends.
+        CloseHandle(hChildStd_OUT_Wr); hChildStd_OUT_Wr = NULL; // Mark as closed
+        CloseHandle(hChildStd_ERR_Wr); hChildStd_ERR_Wr = NULL; // Mark as closed
 
         if (success) {
-            CloseHandle(hChildStd_OUT_Wr); // Close write ends in parent
-            CloseHandle(hChildStd_ERR_Wr);
-
+            // TODO: Pass struct to PipeReaderThread to indicate if it's for stderr
             HANDLE hStdOutReader = CreateThread(NULL, 0, PipeReaderThread, hChildStd_OUT_Rd, 0, NULL);
             HANDLE hStdErrReader = CreateThread(NULL, 0, PipeReaderThread, hChildStd_ERR_Rd, 0, NULL);
-            // TODO: In PipeReaderThread, differentiate if it's stdout or stderr to pass to PostLogChunkToUI
+            // If CreateThread fails, hStdOutReader/hStdErrReader will be NULL.
 
             WaitForSingleObject(pi.hProcess, INFINITE);
             
             DWORD exitCode;
             GetExitCodeProcess(pi.hProcess, &exitCode);
             
-            // Wait for reader threads to finish processing all output
-            if(hStdOutReader) WaitForSingleObject(hStdOutReader, 5000); // Timeout
-            if(hStdErrReader) WaitForSingleObject(hStdErrReader, 5000); // Timeout
-            
-            if(hStdOutReader) CloseHandle(hStdOutReader);
-            if(hStdErrReader) CloseHandle(hStdErrReader);
+            if(hStdOutReader) { WaitForSingleObject(hStdOutReader, 5000); CloseHandle(hStdOutReader); }
+            if(hStdErrReader) { WaitForSingleObject(hStdErrReader, 5000); CloseHandle(hStdErrReader); }
 
             wchar_t exitMsg[100];
             swprintf(exitMsg, sizeof(exitMsg)/sizeof(wchar_t), L"Process finished. Exit code: %lu", exitCode);
-            PostLogChunkToUI((const char*)exitMsg, FALSE, TRUE);
+            PostLogChunkToUI_Wide(exitMsg, FALSE, TRUE);
 
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);
         } else {
             wchar_t errorMsg[256];
             swprintf(errorMsg, sizeof(errorMsg)/sizeof(wchar_t), L"Error starting command: %s (Code: %lu)", fullCmdLine, GetLastError());
-            PostLogChunkToUI((const char*)errorMsg, TRUE, TRUE);
+            PostLogChunkToUI_Wide(errorMsg, TRUE, TRUE);
         }
-        CloseHandle(hChildStd_OUT_Rd); // Close read ends
+
+        CloseHandle(hChildStd_OUT_Rd); 
         CloseHandle(hChildStd_ERR_Rd);
 
+cleanup_task:
         free(task.prefix);
         free(task.suffix);
-        PostMessage(g_hwndMain, WM_APP_COMMAND_DONE, 0, 0); // Signal UI command is done
+        PostMessage(g_hwndMain, WM_APP_COMMAND_DONE, 0, 0); 
     }
     return 0;
 }
@@ -674,41 +740,29 @@ wchar_t* Utf8ToWide(const char* utf8String) {
     return wideString;
 }
 
-// Used for posting internal log messages that are already wchar_t
-// For actual pipe data, use the utf8_chunk version
 void PostLogChunkToUI_Wide(const wchar_t* wide_chunk, BOOL is_stderr_color_hint, BOOL is_progress) {
-    if (!g_hwndMain) { // Window not created yet
-        wprintf(L"%s\n", wide_chunk); // Fallback to console if GUI not ready
+    if (!g_hwndMain) { 
+        if (wide_chunk) wprintf(L"%s\n", wide_chunk); 
         return;
     }
+    if (!wide_chunk) return;
+
     LogChunk* chunkData = (LogChunk*)malloc(sizeof(LogChunk));
     if (!chunkData) return;
     
-    chunkData->text = _wcsdup(wide_chunk); // Duplicate the string
+    chunkData->text = _wcsdup(wide_chunk); 
     if (!chunkData->text) {
         free(chunkData);
         return;
     }
     chunkData->is_progress_line = is_progress;
-    // is_stderr_color_hint is not used in current log display but could be
     
     PostMessageW(g_hwndMain, WM_APP_APPEND_LOG_CHUNK, (WPARAM)is_stderr_color_hint, (LPARAM)chunkData);
 }
 
-
 void PostLogChunkToUI(const char* utf8_chunk, BOOL is_stderr_color_hint, BOOL is_progress) {
-    // This special handling for wchar_t* cast is because some internal logs are already wide
-    if ((uintptr_t)utf8_chunk > 0xFFFF && wcslen((const wchar_t*)utf8_chunk) > 0 && ((const wchar_t*)utf8_chunk)[0] < 256 && IsWindow(g_hwndMain)) {
-         // Heuristic: if it looks like a wide string pointer and window exists, assume it's wide.
-         // This is a HACK because I mixed PostLogChunkToUI calls. Better to have two distinct functions.
-         if (wcslen((const wchar_t*)utf8_chunk) < strlen(utf8_chunk)) { // More robust check
-            PostLogChunkToUI_Wide((const wchar_t*)utf8_chunk, is_stderr_color_hint, is_progress);
-            return;
-         }
-    }
-    
-    if (!g_hwndMain && utf8_chunk) { // Window not created yet
-        printf("%s\n", utf8_chunk); // Fallback to console
+    if (!g_hwndMain && utf8_chunk) { 
+        printf("%s\n", utf8_chunk); 
         return;
     }
     if (!utf8_chunk) return;
@@ -721,8 +775,6 @@ void PostLogChunkToUI(const char* utf8_chunk, BOOL is_stderr_color_hint, BOOL is
         free(chunkData);
         return;
     }
-    // Remove trailing \r if it's a progress line and not followed by \n
-    // The pipe reader should ideally handle this better
     TrimTrailingCr(chunkData->text); 
 
     chunkData->is_progress_line = is_progress;
@@ -734,19 +786,22 @@ void TrimTrailingCr(wchar_t* str) {
     if (!str) return;
     size_t len = wcslen(str);
     if (len > 0 && str[len - 1] == L'\r') {
-        if (len == 1 || (len > 1 && str[len - 2] != L'\n')) { // Check it's not part of \r\n
+        // Only trim \r if it's not part of \r\n
+        // (i.e., it's the last char, or the char before it is not \n)
+        // The pipe reader tries to handle \r for progress lines already.
+        // This is a fallback.
+        if (len == 1 || (len > 1 && str[len - 2] != L'\n')) { 
             str[len - 1] = L'\0';
         }
     }
 }
 
-
-// char* WideToUtf8(const wchar_t* wideString) { // If needed for command arguments
-//     if (!wideString) return NULL;
-//     int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wideString, -1, NULL, 0, NULL, NULL);
-//     if (utf8Len == 0) return NULL;
-//     char* utf8String = (char*)malloc(utf8Len); // No * sizeof(char) needed
-//     if (!utf8String) return NULL;
-//     WideCharToMultiByte(CP_UTF8, 0, wideString, -1, utf8String, utf8Len, NULL, NULL);
-//     return utf8String;
-// }
+// char* WideToUtf8(const wchar_t* wideString) {
+//    if (!wideString) return NULL;
+//    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wideString, -1, NULL, 0, NULL, NULL);
+//    if (utf8Len == 0) return NULL;
+//    char* utf8String = (char*)malloc(utf8Len); // No * sizeof(char) as it's 1
+//    if (!utf8String) return NULL;
+//    WideCharToMultiByte(CP_UTF8, 0, wideString, -1, utf8String, utf8Len, NULL, NULL);
+//    return utf8String;
+//}
