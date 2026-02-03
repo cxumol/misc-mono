@@ -8,7 +8,7 @@
 
 // --- Configuration ---
 #define MAX_LOG_LINES_IN_EDIT_CONTROL 200
-#define DEFAULT_CMD_PREFIX L"yt-dlp -f 233 -N 12"
+#define DEFAULT_CMD_PREFIX L"yt-dlp --js-runtimes quickjs --cookies cookies.txt -f 140 -N 12"
 #define WINDOW_CLASS_NAME L"CmdQueueGUIWindowClass"
 #define MAX_QUEUE_SIZE 100
 #define PIPE_BUFFER_SIZE 4096
@@ -805,3 +805,4 @@ void TrimTrailingCr(wchar_t* str) {
 //    WideCharToMultiByte(CP_UTF8, 0, wideString, -1, utf8String, utf8Len, NULL, NULL);
 //    return utf8String;
 //}
+
